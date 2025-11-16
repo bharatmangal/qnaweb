@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Book → Mock Test (OCR + Auto QG)</title>
+  <!-- Tailwind quick CDN for nice styling -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Tesseract.js (client-side OCR) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4.0.2/dist/tesseract.min.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+  <div class="max-w-5xl mx-auto p-6">
+    <header class="mb-6">
+      <h1 class="text-3xl font-bold">Book → Mock Test</h1>
+      <p class="text-sm text-slate-600 mt-1">Upload or take a photo of text (book/page). App extracts text, auto-generates MCQs, and gives realtime test results.</p>
+    </header>
+
+    <section class="bg-white p-4 rounded shadow mb-6">
+      <div class="flex flex-col md:flex-row gap-4">
+        <div class="flex-1">
+          <label class="block text-sm font-medium mb-1">Upload image (or use camera on mobile)</label>
+          <input id="imgInput" accept="image/*" capture="environment" type="file" class="block w-full p-2 border rounded" />
+          <div id="previewWrap" class="mt-3 hidden">
+            <img id="preview" class="max-h-48 object-contain rounded border" alt="preview" />
+          </div>
+        </div>
+
+        <div class="w-48 flex flex-col gap-2">
+          <label class="block text-sm font-medium">Options</label>
+          <input id="numQuestions" type="number" min="1" max="20" value="8" class="p-2 border rounded" />
+          <select id="mode" class="p-2 border rounded">
+            <option value="mcq">MCQ (Cloze)</option>
+            <option value="tf">True / False (simple)</option>
+          </select>
+          <button id="startOCR" class="bg-blue-600 text-white p-2 rounded hover:bg-blue-700">Extract & Generate</button>
+          <button id="clearBtn" class="bg-gray-200 p-2 rounded hover:bg-gray-300">Clear</button>
+        </div>
+      </div>
+
+      <div id="ocrProgress" class="mt-3 hidden">
+        <div class="text-sm text-slate-600">OCR progress: <span id="ocrPct">0%</span></div>
+        <div class="w-full bg-slate-200 rounded h-2 mt-1">
+          <div id="ocrBar" class="h-2 bg-green-500 rounded" style="width:0%"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid md:grid-cols-3 gap-6">
+      <div class="md:col-span-2 bg-white p-4 rounded shadow">
+        <h2 class="font-semibold mb-2">Extracted Text</h2>
+        <textarea id="extractedText" rows="10" class="w-full p-3 border rounded text-sm" placeholder="Extracted text will appear here..."></textarea>
+
+        <div class="mt-4 flex items-center gap-3">
+          <button id="regenBtn" class="bg-amber-500 text-white p-2 rounded hover:bg-amber-600">Regenerate Questions</button>
+          <button id="previewQuestions" class="bg-indigo-600 text-white p-2 rounded hover:bg-indigo-700">Open Test Interface</button>
+          <div class="text-sm text-slate-500 ml-auto">Tip: crop photo to the text area for best OCR.</div>
+        </div>
+      </div>
+
+      <aside class="bg-white p-4 rounded shadow">
+        <h3 class="font-semibold mb-2">Preview / Stats</h3>
+        <div class="text-sm text-slate-600 mb-2">Generated questions: <strong id="qCount">0</strong></div>
+        <div class="text-sm text-slate-600 mb-4">Mode: <strong id="showMode">MCQ</strong></div>
+
+        <div id="questionListScroll" class="max-h-64 overflow-auto">
+          <ul id="questionList" class="space-y-2 text-sm"></ul>
+        </div>
+
+        <div class="mt-4">
+          <label class="text-sm">Timer (optional minutes)</label>
+          <input id="timerMin" type="number" min="0" value="0" class="w-full p-2 border rounded mt-1" />
+        </div>
+      </aside>
+    </section>
+
+    <!-- Test modal area -->
+    <div id="testArea" class="mt-6 bg-white p-4 rounded shadow hidden">
+      <div class="flex items-start justify-between">
+        <h2 class="text-xl font-semibold">Take Test</h2>
+        <div class="flex items-center gap-3">
+          <div class="text-sm text-slate-600">Score: <span id="scoreNow">0</span>/<span id="scoreTotal">0</span></div>
+          <div id="timerDisplay" class="text-sm text-red-600"></div>
+          <button id="endTest" class="bg-red-500 text-white p-2 rounded hover:bg-red-600">End Test</button>
+        </div>
+      </div>
+
+      <div id="questionsContainer" class="mt-4 space-y-6"></div>
+
+      <div class="mt-4 flex gap-2">
+        <button id="submitAll" class="bg-green-600 text-white p-2 rounded hover:bg-green-700">Submit All</button>
+        <button id="saveResults" class="bg-gray-200 p-2 rounded hover:bg-gray-300">Save Results (Local)</button>
+      </div>
+    </div>
+
+    <footer class="mt-8 text-sm text-slate-500">
+      Generated questions are heuristic. For improved Q/A, integrate a remote QG API (OpenAI, etc.). This demo keeps everything client-side.
+    </footer>
+  </div>
+
+<script>
+/* --- Utilities & simple NLP heuristics --- */
+
+const stopwords = new Set([
+  "the","and","is","in","at","of","a","an","to","for","on","by","with","that","this","these","those","are","was","were","be","has","have","it","as","from","or","but","not","they","their","its","which","also","we","our","you","your"
+]);
+
+function splitSentences(text){
+  // naive sentence splitter
+  return text
+    .replace(/\n+/g, ' ')
+    .split(/(?<=[.?!])\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 15); // keep reasonably long sentences
+}
+
+function wordsFromSentence(s){
+  return s
+    .replace(/[^A-Za-z0-9'\- ]/g, '')
+    .split(/\s+/)
+    .filter(w => w.length > 2);
+}
+
+function candidateAnswerWords(sentence){
+  const words = wordsFromSentence(sentence).map(w => w.trim());
+  const candidates = words.filter(w => !stopwords.has(w.toLowerCase()) && !/^\d+$/.test(w));
+  // prefer longer words / capitalized (possible proper nouns)
+  candidates.sort((a,b) => b.length - a.length);
+  return [...new Set(candidates)];
+}
+
+/* --- OCR + generation pipeline --- */
+
+let generatedQuestions = [];
+let extracted = "";
+
+const imgInput = document.getElementById('imgInput');
+const preview = document.getElementById('preview');
+const previewWrap = document.getElementById('previewWrap');
+const startOCR = document.getElementById('startOCR');
+const ocrBar = document.getElementById('ocrBar');
+const ocrPct = document.getElementById('ocrPct');
+const ocrProgress = document.getElementById('ocrProgress');
+const extractedText = document.getElementById('extractedText');
+const regenBtn = document.getElementById('regenBtn');
+const questionList = document.getElementById('questionList');
+const qCount = document.getElementById('qCount');
+const showMode = document.getElementById('showMode');
+const previewQuestionsBtn = document.getElementById('previewQuestions');
+const testArea = document.getElementById('testArea');
+const questionsContainer = document.getElementById('questionsContainer');
+const scoreNow = document.getElementById('scoreNow');
+const scoreTotal = document.getElementById('scoreTotal');
+const submitAll = document.getElementById('submitAll');
+const endTest = document.getElementById('endTest');
+const timerDisplay = document.getElementById('timerDisplay');
+const numQuestionsEl = document.getElementById('numQuestions');
+const modeEl = document.getElementById('mode');
+const regenTimerEl = document.getElementById('timerMin');
+const clearBtn = document.getElementById('clearBtn');
+const saveResults = document.getElementById('saveResults');
+
+imgInput.addEventListener('change', (e)=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  const url = URL.createObjectURL(f);
+  preview.src = url;
+  previewWrap.classList.remove('hidden');
+});
+
+clearBtn.addEventListener('click', ()=> {
+  imgInput.value = '';
+  preview.src = '';
+  previewWrap.classList.add('hidden');
+  extractedText.value = '';
+  generatedQuestions = [];
+  renderQuestionList();
+  testArea.classList.add('hidden');
+  ocrProgress.classList.add('hidden');
+});
+
+startOCR.addEventListener('click', async ()=>{
+  const f = imgInput.files && imgInput.files[0];
+  if(!f && !extractedText.value.trim()){
+    alert('Please upload or paste an image, or paste text into the "Extracted Text" box.');
+    return;
+  }
+  if(extractedText.value.trim()){
+    // if user already pasted text, skip OCR
+    extracted = extractedText.value.trim();
+    generateQuestionsFromText(extracted);
+    return;
+  }
+
+  // OCR with Tesseract
+  ocrProgress.classList.remove('hidden');
+  ocrPct.textContent = '0%';
+  ocrBar.style.width = '0%';
+  try{
+    const worker = Tesseract.createWorker({
+      logger: m => {
+        if(m.status === 'recognizing text' || m.status === 'progress'){
+          const pct = Math.round((m.progress || 0) * 100);
+          ocrPct.textContent = pct + '%';
+          ocrBar.style.width = pct + '%';
+        }
+      }
+    });
+    await worker.load();
+    await worker.loadLanguage('eng');
+    await worker.initialize('eng');
+    const { data: { text } } = await worker.recognize(f);
+    await worker.terminate();
+    extracted = text;
+    extractedText.value = text;
+    generateQuestionsFromText(text);
+  }catch(err){
+    console.error(err);
+    alert('OCR failed. Try a clearer photo or paste text directly.');
+    ocrProgress.classList.add('hidden');
+  }
+});
+
+regenBtn.addEventListener('click', ()=>{
+  if(!extractedText.value.trim()){
+    alert('Paste or OCR text into the Extracted Text area first.');
+    return;
+  }
+  extracted = extractedText.value.trim();
+  generateQuestionsFromText(extracted);
+});
+
+modeEl.addEventListener('change', ()=>{
+  showMode.textContent = modeEl.value === 'mcq' ? 'MCQ' : 'True/False';
+});
+
+previewQuestionsBtn.addEventListener('click', ()=>{
+  if(generatedQuestions.length === 0){
+    alert('Generate questions first.');
+    return;
+  }
+  openTestInterface();
+});
+
+/* --- Question generation (simple heuristics) --- */
+
+function generateQuestionsFromText(text){
+  generatedQuestions = [];
+  const sentences = splitSentences(text);
+  const desired = Math.max(1, Math.min(20, parseInt(numQuestionsEl.value) || 8));
+  const mode = modeEl.value;
+
+  // collect candidate words across text for distractors
+  const globalCandidates = [];
+  sentences.forEach(s => {
+    candidateAnswerWords(s).forEach(w => globalCandidates.push(w));
+  });
+  // keep unique
+  const uniqGlobal = [...new Set(globalCandidates)].filter(Boolean);
+
+  // prefer sentences with candidate words
+  const usable = sentences.filter(s => candidateAnswerWords(s).length > 0);
+  for(let i=0; i < Math.min(desired, usable.length); i++){
+    const s = usable[i]; // simple: take in-order; could randomize
+    const candidates = candidateAnswerWords(s);
+    if(candidates.length === 0) continue;
+    const answer = candidates[0]; // best candidate (longest)
+    if(mode === 'mcq'){
+      // create 3 distractors from global candidates
+      let distractors = [];
+      const shuffled = uniqGlobal.filter(w => w.toLowerCase() !== answer.toLowerCase()).sort(()=>Math.random()-0.5);
+      // pick 3
+      for(let j=0; j<shuffled.length && distractors.length < 3; j++){
+        const d = shuffled[j];
+        if(d && d.length > 2 && !distractors.includes(d)) distractors.push(d);
+      }
+      // if not enough distractors, fabricate by altering answer (basic)
+      while(distractors.length < 3){
+        const alt = answer.split('').sort(()=>Math.random()-0.5).join('').slice(0, Math.max(3, Math.min(8, answer.length)));
+        if(!distractors.includes(alt) && alt !== answer) distractors.push(alt);
+      }
+      // build cloze: replace the answer in sentence with blank (first occurrence)
+      const blankSent = s.replace(new RegExp(answer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '_____');
+      const options = [answer, ...distractors].sort(()=>Math.random()-0.5);
+      generatedQuestions.push({
+        type: 'mcq',
+        question: blankSent,
+        correct: answer,
+        options
+      });
+    } else {
+      // True/False: use the sentence as a statement, mark true
+      generatedQuestions.push({
+        type: 'tf',
+        question: s,
+        correct: 'True'
+      });
+    }
+  }
+
+  // if not enough, try making from remaining sentences (random)
+  if(generatedQuestions.length < desired){
+    const more = sentences.slice(generatedQuestions.length).sort(()=>Math.random()-0.5);
+    for(let s of more){
+      if(generatedQuestions.length >= desired) break;
+      const cand = candidateAnswerWords(s);
+      if(cand.length === 0) continue;
+      const answer = cand[0];
+      if(mode === 'mcq'){
+        const shuffled = uniqGlobal.filter(w => w.toLowerCase() !== answer.toLowerCase()).sort(()=>Math.random()-0.5);
+        let distractors = shuffled.slice(0,3);
+        while(distractors.length < 3){
+          distractors.push(answer.split('').reverse().join('').slice(0,5));
+        }
+        const blankSent = s.replace(new RegExp(answer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '_____');
+        const options = [answer, ...distractors].sort(()=>Math.random()-0.5);
+        generatedQuestions.push({type:'mcq', question: blankSent, correct: answer, options});
+      } else {
+        generatedQuestions.push({type:'tf', question: s, correct: 'True'});
+      }
+    }
+  }
+
+  // enforce desired count
+  generatedQuestions = generatedQuestions.slice(0, desired);
+  renderQuestionList();
+  alert(`Generated ${generatedQuestions.length} questions (mode: ${modeEl.value}).`);
+}
+
+/* --- UI rendering for question preview --- */
+
+function renderQuestionList(){
+  questionList.innerHTML = '';
+  qCount.textContent = generatedQuestions.length;
+  showMode.textContent = modeEl.value === 'mcq' ? 'MCQ' : 'True/False';
+  generatedQuestions.forEach((q, idx) => {
+    const li = document.createElement('li');
+    li.className = 'p-2 border rounded bg-slate-50';
+    if(q.type === 'mcq'){
+      li.innerHTML = `<div class="font-medium">Q${idx+1} (MCQ)</div><div class="text-sm mt-1">${escapeHtml(q.question)}</div><div class="mt-2 text-xs text-slate-600">Answer: <strong>${escapeHtml(q.correct)}</strong></div>`;
+    } else {
+      li.innerHTML = `<div class="font-medium">Q${idx+1} (True/False)</div><div class="text-sm mt-1">${escapeHtml(q.question)}</div><div class="mt-2 text-xs text-slate-600">Answer: <strong>${escapeHtml(q.correct)}</strong></div>`;
+    }
+    questionList.appendChild(li);
+  });
+}
+
+/* --- Test Interface & realtime scoring --- */
+
+let answersGiven = {};
+let timerInterval = null;
+let timeLeftSeconds = 0;
+
+function openTestInterface(){
+  testArea.classList.remove('hidden');
+  questionsContainer.innerHTML = '';
+  answersGiven = {};
+  scoreNow.textContent = '0';
+  scoreTotal.textContent = generatedQuestions.length;
+  // render questions
+  generatedQuestions.forEach((q, idx) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'p-3 border rounded bg-white';
+    const qnum = document.createElement('div');
+    qnum.className = 'font-medium';
+    qnum.textContent = `Q${idx+1}`;
+    const qtext = document.createElement('div');
+    qtext.className = 'mt-2 text-sm';
+    qtext.innerHTML = escapeHtml(q.question);
+    wrap.appendChild(qnum);
+    wrap.appendChild(qtext);
+
+    if(q.type === 'mcq'){
+      const optList = document.createElement('div');
+      optList.className = 'mt-3 flex flex-col gap-2';
+      q.options.forEach(opt => {
+        const id = `q${idx}_${opt}`;
+        const label = document.createElement('label');
+        label.className = 'inline-flex items-center gap-2 p-2 border rounded hover:bg-slate-50';
+        label.innerHTML = `<input name="q${idx}" type="radio" value="${escapeHtml(opt)}" /> <span class="text-sm">${escapeHtml(opt)}</span>`;
+        optList.appendChild(label);
+        // real-time listener
+        label.querySelector('input').addEventListener('change', ()=> {
+          answersGiven[idx] = opt;
+          checkRealtimeScore();
+        });
+      });
+      wrap.appendChild(optList);
+    } else {
+      const optList = document.createElement('div');
+      optList.className = 'mt-3 flex gap-2';
+      ['True', 'False'].forEach(opt => {
+        const label = document.createElement('label');
+        label.className = 'inline-flex items-center gap-2 p-2 border rounded hover:bg-slate-50';
+        label.innerHTML = `<input name="q${idx}" type="radio" value="${opt}" /> <span class="text-sm">${opt}</span>`;
+        optList.appendChild(label);
+        label.querySelector('input').addEventListener('change', ()=> {
+          answersGiven[idx] = opt;
+          checkRealtimeScore();
+        });
+      });
+      wrap.appendChild(optList);
+    }
+
+    // feedback area
+    const feed = document.createElement('div');
+    feed.className = 'mt-2 text-sm';
+    feed.id = `feedback_${idx}`;
+    wrap.appendChild(feed);
+
+    questionsContainer.appendChild(wrap);
+  });
+
+  // timer
+  const tmin = parseInt(regenTimerEl.value) || 0;
+  if(timerInterval) { clearInterval(timerInterval); timerInterval = null;}
+  if(tmin > 0){
+    timeLeftSeconds = tmin * 60;
+    timerDisplay.textContent = formatTime(timeLeftSeconds);
+    timerInterval = setInterval(()=>{
+      timeLeftSeconds--;
+      timerDisplay.textContent = formatTime(timeLeftSeconds);
+      if(timeLeftSeconds <= 0){
+        clearInterval(timerInterval);
+        timerInterval = null;
+        alert('Time up! Auto-submitting...');
+        submitTest();
+      }
+    }, 1000);
+  } else {
+    timerDisplay.textContent = '';
+  }
+}
+
+function formatTime(sec){
+  const m = Math.floor(sec/60).toString().padStart(2,'0');
+  const s = (sec%60).toString().padStart(2,'0');
+  return `${m}:${s}`;
+}
+
+function checkRealtimeScore(){
+  let correct = 0;
+  generatedQuestions.forEach((q, idx) => {
+    const user = answersGiven[idx];
+    const fb = document.getElementById(`feedback_${idx}`);
+    if(!user){
+      if(fb) fb.textContent = '';
+      return;
+    }
+    if(q.type === 'mcq'){
+      if(user.toLowerCase() === q.correct.toLowerCase()){
+        correct++;
+        if(fb) fb.innerHTML = '<span class="text-green-700 font-semibold">Correct</span>';
+      } else {
+        if(fb) fb.innerHTML = `<span class="text-red-600 font-semibold">Incorrect</span> — Correct: <strong>${escapeHtml(q.correct)}</strong>`;
+      }
+    } else {
+      if(user === q.correct){
+        correct++;
+        if(fb) fb.innerHTML = '<span class="text-green-700 font-semibold">Correct</span>';
+      } else {
+        if(fb) fb.innerHTML = `<span class="text-red-600 font-semibold">Incorrect</span> — Correct: <strong>${escapeHtml(q.correct)}</strong>`;
+      }
+    }
+  });
+  scoreNow.textContent = String(correct);
+}
+
+submitAll.addEventListener('click', submitTest);
+endTest.addEventListener('click', ()=>{
+  if(confirm('End test now?')) submitTest();
+});
+
+function submitTest(){
+  if(timerInterval){
+    clearInterval(timerInterval);
+    timerInterval = null;
+    timerDisplay.textContent = '';
+  }
+  let correct = 0;
+  generatedQuestions.forEach((q, idx) => {
+    const user = answersGiven[idx];
+    const fb = document.getElementById(`feedback_${idx}`);
+    if(q.type === 'mcq' && user && user.toLowerCase() === q.correct.toLowerCase()){
+      correct++;
+    } else if(q.type === 'tf' && user === q.correct){
+      correct++;
+    }
+    // set final feedback also (if not already)
+    if(fb){
+      if(!user){
+        fb.innerHTML = `<span class="text-orange-600">Unanswered</span> — Correct: <strong>${escapeHtml(q.correct)}</strong>`;
+      } else if((q.type==='mcq' && user.toLowerCase() === q.correct.toLowerCase()) || (q.type==='tf' && user === q.correct)){
+        fb.innerHTML = '<span class="text-green-700 font-semibold">Correct</span>';
+      } else {
+        fb.innerHTML = `<span class="text-red-600 font-semibold">Incorrect</span> — Correct: <strong>${escapeHtml(q.correct)}</strong>`;
+      }
+    }
+  });
+  scoreNow.textContent = String(correct);
+  scoreTotal.textContent = generatedQuestions.length;
+  alert(`Test submitted. Score: ${correct}/${generatedQuestions.length}`);
+}
+
+saveResults.addEventListener('click', ()=>{
+  const results = {
+    date: new Date().toISOString(),
+    extractedSnippet: extracted.slice(0,300),
+    questions: generatedQuestions,
+    answers: answersGiven,
+    score: `${scoreNow.textContent}/${scoreTotal.textContent}`
+  };
+  const key = 'book_mock_test_results';
+  const prev = JSON.parse(localStorage.getItem(key) || '[]');
+  prev.push(results);
+  localStorage.setItem(key, JSON.stringify(prev, null, 2));
+  alert('Results saved locally in browser storage.');
+});
+
+/* --- helpers --- */
+
+function escapeHtml(str){
+  if(!str) return '';
+  return (''+str)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'", '&#39;');
+}
+</script>
+</body>
+</html>
